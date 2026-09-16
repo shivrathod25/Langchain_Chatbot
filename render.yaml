@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: chatbot-langchain
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "uvicorn backend.main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash
+      - key: Gemini_Api_Key
+        sync: false
+      - key: DATABASE_URL
+        sync: false
