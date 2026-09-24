@@ -10,20 +10,29 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 load_dotenv(dotenv_path=BASE_DIR.parent / ".env")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/agentic_ai")
+# Track database connection status and fallback details
+IS_POSTGRES = False
+IS_FALLBACK = False
+FALLBACK_REASON = None
+CONFIGURED_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/agentic_ai")
 
 # Fix Render PostgreSQL URL dialect compatibility (postgres:// -> postgresql://)
-if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+if CONFIGURED_URL and CONFIGURED_URL.startswith("postgres://"):
+    CONFIGURED_URL = CONFIGURED_URL.replace("postgres://", "postgresql://", 1)
 
 def create_db_engine(url: str):
     engine_kwargs = {"pool_pre_ping": True, "echo": False}
     if url.startswith("sqlite"):
         engine_kwargs["connect_args"] = {"check_same_thread": False}
     else:
-        engine_kwargs["pool_recycle"] = 3600
+        engine_kwargs["pool_recycle"] = 300
+        # For remote PostgreSQL (e.g. Render, Neon, Supabase), ensure SSL is enabled if not already configured
+        if url.startswith("postgresql") and not any(h in url for h in ["localhost", "127.0.0.1", "postgres:postgres@db"]):
+            if "sslmode" not in url:
+                engine_kwargs["connect_args"] = {"sslmode": "require"}
     return create_engine(url, **engine_kwargs)
 
+DATABASE_URL = CONFIGURED_URL
 engine = create_db_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -55,19 +64,39 @@ class Order(Base):
     product = relationship("Product", back_populates="orders")
 
 
+def sync_postgres_sequences():
+    """Ensure PostgreSQL autoincrement sequences are aligned with max ID in tables."""
+    if str(engine.url).startswith("postgresql"):
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT setval(pg_get_serial_sequence('\"Product\"', 'product_id'), COALESCE(MAX(product_id), 1), true) FROM \"Product\";"))
+                conn.execute(text("SELECT setval(pg_get_serial_sequence('\"Order\"', 'order_id'), COALESCE(MAX(order_id), 1), true) FROM \"Order\";"))
+                conn.commit()
+                print("PostgreSQL primary key sequences synchronized.")
+        except Exception as seq_err:
+            print(f"Sequence sync note: {seq_err}")
+
+
 def init_db():
     """Create tables if they do not exist, falling back to SQLite if primary DB is unavailable."""
-    global engine, SessionLocal
+    global engine, SessionLocal, IS_POSTGRES, IS_FALLBACK, FALLBACK_REASON
     try:
         # Test connection to configured engine
         with engine.connect() as conn:
-            pass
+            conn.execute(text("SELECT 1"))
         Base.metadata.create_all(bind=engine)
+        IS_POSTGRES = str(engine.url).startswith("postgresql")
+        IS_FALLBACK = False
+        FALLBACK_REASON = None
+        print(f"Successfully connected to primary database ({engine.dialect.name}).")
     except Exception as e:
-        print(f"Primary database connection failed ({e}). Falling back to SQLite local database.")
+        IS_POSTGRES = False
+        IS_FALLBACK = True
+        FALLBACK_REASON = str(e)
+        print(f"Primary PostgreSQL connection failed ({e}). Falling back to SQLite local database.")
         sqlite_db_path = BASE_DIR.parent / "agentic_ai.db"
-        DATABASE_URL = f"sqlite:///{sqlite_db_path}"
-        engine = create_db_engine(DATABASE_URL)
+        fallback_url = f"sqlite:///{sqlite_db_path}"
+        engine = create_db_engine(fallback_url)
         SessionLocal.configure(bind=engine)
         Base.metadata.create_all(bind=engine)
 
@@ -87,6 +116,25 @@ def init_db():
                         conn.commit()
     except Exception as alter_err:
         print(f"Schema migration note: {alter_err}")
+
+    # Schema Migration: Ensure foreign key on Order correctly references "Product" in PostgreSQL
+    if str(engine.url).startswith("postgresql"):
+        try:
+            with engine.connect() as conn:
+                fk_def = conn.execute(text("""
+                    SELECT ccu.table_name 
+                    FROM information_schema.table_constraints tc 
+                    JOIN information_schema.constraint_column_usage ccu ON ccu.constraint_name = tc.constraint_name 
+                    WHERE tc.table_name = 'Order' AND tc.constraint_type = 'FOREIGN KEY' AND ccu.column_name = 'product_id' LIMIT 1;
+                """)).scalar()
+                if fk_def and fk_def == "product":
+                    print("Migrating Order foreign key constraint to reference \"Product\"...")
+                    conn.execute(text('ALTER TABLE "Order" DROP CONSTRAINT IF EXISTS "Order_product_id_fkey";'))
+                    conn.execute(text('ALTER TABLE "Order" ADD CONSTRAINT "Order_product_id_fkey" FOREIGN KEY (product_id) REFERENCES "Product"(product_id) ON DELETE SET NULL;'))
+                    conn.commit()
+                    print("Foreign key migration completed successfully.")
+        except Exception as fk_err:
+            print(f"Foreign key migration note: {fk_err}")
 
     # Populate any missing total_amount values in Order table
     try:
@@ -127,6 +175,41 @@ def init_db():
     finally:
         db.close()
 
+    # Synchronize sequences for PostgreSQL
+    sync_postgres_sequences()
+
+
+def get_db_status():
+    """Return runtime database health, dialect, and fallback status."""
+    dialect = engine.dialect.name
+    is_postgres = dialect == "postgresql"
+    is_healthy = False
+    err = None
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            is_healthy = True
+    except Exception as e:
+        err = str(e)
+
+    # Mask credentials for display
+    url_str = str(engine.url)
+    masked_url = url_str
+    if "@" in url_str:
+        prefix, host_part = url_str.split("@", 1)
+        protocol = prefix.split("://")[0] if "://" in prefix else "db"
+        masked_url = f"{protocol}://***:***@{host_part}"
+
+    return {
+        "dialect": dialect,
+        "is_postgres": is_postgres,
+        "healthy": is_healthy,
+        "error": err,
+        "using_fallback": IS_FALLBACK,
+        "fallback_reason": FALLBACK_REASON,
+        "masked_url": masked_url
+    }
+
 
 def get_db():
     """Dependency that yields a database session and ensures clean closure."""
@@ -135,4 +218,5 @@ def get_db():
         yield db
     finally:
         db.close()
+
 

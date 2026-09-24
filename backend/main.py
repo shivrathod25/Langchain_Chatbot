@@ -312,13 +312,19 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.get("/api/health", tags=["System"])
 def health_check():
+    db_status = database.get_db_status()
     return {
         "status": "online",
         "project": PROJECT_NAME,
         "version": VERSION,
         "model": GEMINI_MODEL,
+        "database": db_status,
         "docs": "/docs"
     }
+
+@app.get("/api/db-status", tags=["System"])
+def get_db_status_endpoint():
+    return database.get_db_status()
 
 # STATS
 @app.get("/api/stats", response_model=DashboardStats, tags=["Stats"])
@@ -371,31 +377,52 @@ def get_product(product_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/products", response_model=ProductResponse, status_code=status.HTTP_201_CREATED, tags=["Products"])
 def create_product(product_in: ProductCreate, db: Session = Depends(get_db)):
-    db_product = Product(**product_in.model_dump())
-    db.add(db_product)
-    db.commit()
-    db.refresh(db_product)
-    return db_product
+    try:
+        db_product = Product(**product_in.model_dump())
+        db.add(db_product)
+        db.commit()
+        db.refresh(db_product)
+        database.sync_postgres_sequences()
+        return db_product
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating product: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error while saving product: {str(e)}")
 
 @app.put("/api/products/{product_id}", response_model=ProductResponse, tags=["Products"])
 def update_product(product_id: int, product_in: ProductUpdate, db: Session = Depends(get_db)):
-    prod = db.query(Product).filter(Product.product_id == product_id).first()
-    if not prod:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    for field, val in product_in.model_dump(exclude_unset=True).items():
-        setattr(prod, field, val)
-    db.commit()
-    db.refresh(prod)
-    return prod
+    try:
+        prod = db.query(Product).filter(Product.product_id == product_id).first()
+        if not prod:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        for field, val in product_in.model_dump(exclude_unset=True).items():
+            setattr(prod, field, val)
+        db.commit()
+        db.refresh(prod)
+        return prod
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating product: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error while updating product: {str(e)}")
 
 @app.delete("/api/products/{product_id}", tags=["Products"])
 def delete_product(product_id: int, db: Session = Depends(get_db)):
-    prod = db.query(Product).filter(Product.product_id == product_id).first()
-    if not prod:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-    db.delete(prod)
-    db.commit()
-    return {"message": f"Product {product_id} deleted successfully", "product_id": product_id}
+    try:
+        prod = db.query(Product).filter(Product.product_id == product_id).first()
+        if not prod:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        db.delete(prod)
+        db.commit()
+        database.sync_postgres_sequences()
+        return {"message": f"Product {product_id} deleted successfully", "product_id": product_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting product: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error while deleting product: {str(e)}")
 
 # ORDERS
 @app.get("/api/orders", response_model=List[OrderDetailResponse], tags=["Orders"])
@@ -440,49 +467,105 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
 
 @app.post("/api/orders", response_model=OrderDetailResponse, status_code=status.HTTP_201_CREATED, tags=["Orders"])
 def create_order(order_in: OrderCreate, db: Session = Depends(get_db)):
-    prod = db.query(Product).filter(Product.product_id == order_in.product_id).first()
-    if not prod:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Referenced product does not exist")
-
-    order_dict = order_in.model_dump()
-    if not order_dict.get("total_amount"):
-        order_dict["total_amount"] = Decimal(str(prod.price)) * Decimal(str(order_dict["quantity"]))
-    if not order_dict.get("order_date"):
-        order_dict["order_date"] = date.today()
-
-    db_order = Order(**order_dict)
-    db.add(db_order)
-    db.commit()
-    db.refresh(db_order)
-    return db.query(Order).options(joinedload(Order.product)).filter(Order.order_id == db_order.order_id).first()
-
-@app.put("/api/orders/{order_id}", response_model=OrderDetailResponse, tags=["Orders"])
-def update_order(order_id: int, order_in: OrderUpdate, db: Session = Depends(get_db)):
-    db_order = db.query(Order).filter(Order.order_id == order_id).first()
-    if not db_order:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-
-    update_data = order_in.model_dump(exclude_unset=True)
-    if "product_id" in update_data and update_data["product_id"] != db_order.product_id:
-        prod = db.query(Product).filter(Product.product_id == update_data["product_id"]).first()
+    try:
+        prod = db.query(Product).filter(Product.product_id == order_in.product_id).first()
         if not prod:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Referenced product does not exist")
 
-    for field, value in update_data.items():
-        setattr(db_order, field, value)
+        order_dict = order_in.model_dump()
+        if not order_dict.get("total_amount"):
+            order_dict["total_amount"] = Decimal(str(prod.price)) * Decimal(str(order_dict["quantity"]))
+        if not order_dict.get("order_date"):
+            order_dict["order_date"] = date.today()
 
-    db.commit()
-    db.refresh(db_order)
-    return db.query(Order).options(joinedload(Order.product)).filter(Order.order_id == db_order.order_id).first()
+        # Update product stock quantity in database
+        if prod.stock_quantity is not None:
+            prod.stock_quantity = max(0, prod.stock_quantity - order_dict["quantity"])
+
+        db_order = Order(**order_dict)
+        db.add(db_order)
+        db.commit()
+        db.refresh(db_order)
+        database.sync_postgres_sequences()
+        return db.query(Order).options(joinedload(Order.product)).filter(Order.order_id == db_order.order_id).first()
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error creating order: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error while creating order: {str(e)}")
+
+@app.put("/api/orders/{order_id}", response_model=OrderDetailResponse, tags=["Orders"])
+def update_order(order_id: int, order_in: OrderUpdate, db: Session = Depends(get_db)):
+    try:
+        db_order = db.query(Order).filter(Order.order_id == order_id).first()
+        if not db_order:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+        old_product_id = db_order.product_id
+        old_quantity = db_order.quantity or 0
+
+        update_data = order_in.model_dump(exclude_unset=True)
+        new_product_id = update_data.get("product_id", old_product_id)
+        new_quantity = update_data.get("quantity", old_quantity)
+
+        # Handle product change or quantity adjustment in stock
+        if old_product_id != new_product_id:
+            old_prod = db.query(Product).filter(Product.product_id == old_product_id).first()
+            if old_prod and old_prod.stock_quantity is not None:
+                old_prod.stock_quantity += old_quantity
+
+            new_prod = db.query(Product).filter(Product.product_id == new_product_id).first()
+            if not new_prod:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Referenced product does not exist")
+            if new_prod.stock_quantity is not None:
+                new_prod.stock_quantity = max(0, new_prod.stock_quantity - new_quantity)
+            if "total_amount" not in update_data:
+                update_data["total_amount"] = Decimal(str(new_prod.price)) * Decimal(str(new_quantity))
+        elif old_quantity != new_quantity:
+            prod = db.query(Product).filter(Product.product_id == old_product_id).first()
+            if prod and prod.stock_quantity is not None:
+                diff = new_quantity - old_quantity
+                prod.stock_quantity = max(0, prod.stock_quantity - diff)
+            if "total_amount" not in update_data and prod and prod.price:
+                update_data["total_amount"] = Decimal(str(prod.price)) * Decimal(str(new_quantity))
+
+        for field, value in update_data.items():
+            setattr(db_order, field, value)
+
+        db.commit()
+        db.refresh(db_order)
+        return db.query(Order).options(joinedload(Order.product)).filter(Order.order_id == db_order.order_id).first()
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error updating order: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error while updating order: {str(e)}")
 
 @app.delete("/api/orders/{order_id}", tags=["Orders"])
 def delete_order(order_id: int, db: Session = Depends(get_db)):
-    db_order = db.query(Order).filter(Order.order_id == order_id).first()
-    if not db_order:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    db.delete(db_order)
-    db.commit()
-    return {"message": f"Order {order_id} deleted successfully", "order_id": order_id}
+    try:
+        db_order = db.query(Order).filter(Order.order_id == order_id).first()
+        if not db_order:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+
+        # Restore product stock upon order cancellation/deletion
+        if db_order.product_id:
+            prod = db.query(Product).filter(Product.product_id == db_order.product_id).first()
+            if prod and prod.stock_quantity is not None and db_order.quantity:
+                prod.stock_quantity += db_order.quantity
+
+        db.delete(db_order)
+        db.commit()
+        database.sync_postgres_sequences()
+        return {"message": f"Order {order_id} deleted successfully", "order_id": order_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error deleting order: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Database error while deleting order: {str(e)}")
 
 # CHAT ENDPOINT
 @app.post("/api/chat", response_model=ChatResponse, tags=["AI Chatbot"])

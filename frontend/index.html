@@ -1670,16 +1670,32 @@
 
     // Health Check
     async function checkHealth() {
+      const statusBadge = document.getElementById("system-status");
       try {
         const res = await fetch(`${API_BASE}/api/health`);
-        const statusBadge = document.getElementById("system-status");
         if (res.ok) {
+          const data = await res.json();
+          const db = data.database;
+          if (db && db.is_postgres && db.healthy) {
+            statusBadge.innerHTML = `<div class="status-dot" style="background:#10B981"></div><span>PostgreSQL Connected</span>`;
+            statusBadge.title = `Active Database: PostgreSQL (${db.masked_url})`;
+            statusBadge.style.borderColor = "rgba(16, 185, 129, 0.4)";
+          } else if (db && db.using_fallback) {
+            statusBadge.innerHTML = `<div class="status-dot" style="background:#F59E0B"></div><span style="color:#F59E0B">SQLite Fallback</span>`;
+            statusBadge.title = `PostgreSQL failed (${db.fallback_reason || 'Connection failed'}). Using SQLite fallback. Configure DATABASE_URL.`;
+            statusBadge.style.borderColor = "rgba(245, 158, 11, 0.4)";
+          } else {
+            statusBadge.innerHTML = `<div class="status-dot"></div><span>API Connected</span>`;
+          }
+          statusBadge.style.display = "flex";
+        } else {
+          statusBadge.innerHTML = `<div class="status-dot" style="background:var(--danger)"></div><span style="color:var(--danger)">API Error</span>`;
           statusBadge.style.display = "flex";
         }
       } catch (err) {
-        const statusBadge = document.getElementById("system-status");
         statusBadge.innerHTML = `<span style="color:var(--danger)">Offline (Run main.py)</span>`;
         statusBadge.style.borderColor = "var(--danger)";
+        statusBadge.style.display = "flex";
       }
     }
 
