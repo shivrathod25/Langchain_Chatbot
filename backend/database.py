@@ -145,37 +145,6 @@ def init_db():
     except Exception as pop_err:
         print(f"Total amount update note: {pop_err}")
 
-    # Seed sample data if database is empty
-    db = SessionLocal()
-    try:
-        if db.query(Product).count() == 0:
-            print("Seeding initial database records...")
-            sample_products = [
-                Product(product_name="Wireless Noise-Canceling Headphones", category="Electronics", price=199.99, stock_quantity=45),
-                Product(product_name="Mechanical Gaming Keyboard", category="Electronics", price=129.50, stock_quantity=30),
-                Product(product_name="Ergonomic Mesh Office Chair", category="Furniture", price=249.00, stock_quantity=12),
-                Product(product_name="Stainless Steel Smart Water Bottle", category="Accessories", price=39.99, stock_quantity=80),
-                Product(product_name="Ultra-Wide 4K Gaming Monitor", category="Electronics", price=499.99, stock_quantity=8),
-                Product(product_name="Organic Cotton Hoodie", category="Apparel", price=59.95, stock_quantity=50),
-            ]
-            db.add_all(sample_products)
-            db.commit()
-
-            sample_orders = [
-                Order(product_id=1, customer_name="Alice Smith", quantity=1, order_date=date(2026, 9, 15), total_amount=199.99),
-                Order(product_id=2, customer_name="Bob Jones", quantity=2, order_date=date(2026, 9, 18), total_amount=259.00),
-                Order(product_id=3, customer_name="Carol White", quantity=1, order_date=date(2026, 9, 20), total_amount=249.00),
-                Order(product_id=4, customer_name="David Brown", quantity=3, order_date=date(2026, 9, 21), total_amount=119.97),
-            ]
-            db.add_all(sample_orders)
-            db.commit()
-            print("Seed completed successfully.")
-    except Exception as seed_err:
-        db.rollback()
-        print(f"Database seeding note: {seed_err}")
-    finally:
-        db.close()
-
     # Synchronize sequences for PostgreSQL
     sync_postgres_sequences()
 
