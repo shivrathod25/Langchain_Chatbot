@@ -1633,8 +1633,8 @@
     }
 
     // BACKEND API CONFIGURATION
-    // Render Backend URL
-    const API_BASE = 'https://langchain-chatbot-xkja.onrender.com';
+    // Dynamic API Base URL (uses current origin when served on Render or locally, fallback to localhost)
+    const API_BASE = window.location.origin.startsWith('http') ? window.location.origin : 'http://localhost:8000';
 
     let productsCache = [];
     let deleteCallback = null;

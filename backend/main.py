@@ -23,9 +23,14 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 try:
-    from database import engine, Base, Product, Order, get_db, init_db
+    import database
 except ModuleNotFoundError:
-    from backend.database import engine, Base, Product, Order, get_db, init_db
+    import backend.database as database
+
+Product = database.Product
+Order = database.Order
+get_db = database.get_db
+init_db = database.init_db
 
 # Load .env from backend and root directories
 load_dotenv(dotenv_path=BASE_DIR / ".env")
@@ -89,7 +94,7 @@ class OrderDetailResponse(BaseModel):
     customer_name: str
     quantity: int
     order_date: Optional[date]
-    total_amount: Decimal
+    total_amount: Optional[Decimal] = None
     product: Optional[ProductResponse] = None
     model_config = ConfigDict(from_attributes=True)
 
@@ -177,21 +182,22 @@ def is_safe_sql(sql_query: str) -> bool:
     return True
 
 def get_db_schema_summary() -> str:
-    inspector = inspect(engine)
+    inspector = inspect(database.engine)
     schema_info = []
-    for table_name in ["product", "order"]:
-        if inspector.has_table(table_name):
+    available_tables = inspector.get_table_names()
+    for table_name in available_tables:
+        if table_name.lower() in ["product", "order"]:
             columns = inspector.get_columns(table_name)
             col_desc = ", ".join([f"{c['name']} ({c['type']})" for c in columns])
-            schema_info.append(f"Table `{table_name}`: columns [{col_desc}]")
-    schema_info.append("Note: Table `order` is a SQL reserved word, so always enclose it in backticks like `order`.")
-    schema_info.append("Relationship: `order`.product_id references `product`.product_id.")
+            schema_info.append(f"Table \"{table_name}\": columns [{col_desc}]")
+    schema_info.append("Note: In PostgreSQL, enclose table names in quotes if required e.g. \"Order\" or \"Product\".")
+    schema_info.append("Relationship: Order.product_id references Product.product_id.")
     return "\n".join(schema_info)
 
 SQL_PROMPT = PromptTemplate(
     input_variables=["schema", "user_question"],
     template="""You are a senior database AI agent for an e-commerce platform.
-Generate a single MySQL read-only SELECT query to answer the user's question based on the live database schema below.
+Generate a single PostgreSQL read-only SELECT query to answer the user's question based on the live PostgreSQL database schema below.
 
 DATABASE SCHEMA:
 {schema}
@@ -199,9 +205,9 @@ DATABASE SCHEMA:
 RULES:
 1. Return ONLY the raw SQL query inside a code block ```sql ... ``` or plain text. No commentary.
 2. Only write read-only SELECT queries. Never write DROP, DELETE, UPDATE, INSERT, ALTER, TRUNCATE.
-3. Use backticks for table `order` e.g. FROM `order`.
+3. Use exact table names e.g. "Order" or "Product". Enclose table "Order" in double quotes e.g. FROM "Order".
 4. Use aggregation functions (COUNT, SUM, AVG, MAX, MIN), JOINs, ORDER BY, and LIMIT where relevant.
-5. Use LIKE / case-insensitive search for names or categories if appropriate.
+5. Use ILIKE / case-insensitive search for names or categories in PostgreSQL.
 
 USER QUESTION: {user_question}
 
@@ -245,7 +251,7 @@ def ask_ai_agent(user_question: str) -> str:
         if not is_safe_sql(sql_query):
             return "⚠️ Security Alert: Only read-only SELECT queries are allowed."
 
-        with engine.connect() as conn:
+        with database.engine.connect() as conn:
             result = conn.execute(text(sql_query))
             rows = result.mappings().all()
             formatted_rows = []
@@ -411,13 +417,25 @@ def get_orders(
         query = query.filter(Order.order_date >= start_date)
     if end_date:
         query = query.filter(Order.order_date <= end_date)
-    return query.order_by(Order.order_id.desc()).offset(skip).limit(limit).all()
+    orders = query.order_by(Order.order_id.desc()).offset(skip).limit(limit).all()
+    for o in orders:
+        if o.total_amount is None:
+            if o.product and o.product.price:
+                o.total_amount = Decimal(str(o.product.price)) * Decimal(str(o.quantity or 1))
+            else:
+                o.total_amount = Decimal("0.00")
+    return orders
 
 @app.get("/api/orders/{order_id}", response_model=OrderDetailResponse, tags=["Orders"])
 def get_order(order_id: int, db: Session = Depends(get_db)):
     order = db.query(Order).options(joinedload(Order.product)).filter(Order.order_id == order_id).first()
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+    if order.total_amount is None:
+        if order.product and order.product.price:
+            order.total_amount = Decimal(str(order.product.price)) * Decimal(str(order.quantity or 1))
+        else:
+            order.total_amount = Decimal("0.00")
     return order
 
 @app.post("/api/orders", response_model=OrderDetailResponse, status_code=status.HTTP_201_CREATED, tags=["Orders"])
