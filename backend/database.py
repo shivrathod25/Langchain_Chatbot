@@ -15,10 +15,11 @@ IS_POSTGRES = False
 IS_FALLBACK = False
 FALLBACK_REASON = None
 CONFIGURED_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/agentic_ai")
+if CONFIGURED_URL:
+    CONFIGURED_URL = CONFIGURED_URL.strip().strip("'\"")
+    if CONFIGURED_URL.startswith("postgres://"):
+        CONFIGURED_URL = CONFIGURED_URL.replace("postgres://", "postgresql://", 1)
 
-# Fix Render PostgreSQL URL dialect compatibility (postgres:// -> postgresql://)
-if CONFIGURED_URL and CONFIGURED_URL.startswith("postgres://"):
-    CONFIGURED_URL = CONFIGURED_URL.replace("postgres://", "postgresql://", 1)
 
 def create_db_engine(url: str):
     engine_kwargs = {"pool_pre_ping": True, "echo": False}
